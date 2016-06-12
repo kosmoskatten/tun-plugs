@@ -5,6 +5,7 @@ module Main
 
 import Conduit
 import Control.Concurrent.Async (async, wait)
+import Control.Monad (forever)
 import Data.ByteString (ByteString)
 import Data.Conduit.Cereal
 import Data.Conduit.Network
@@ -12,6 +13,8 @@ import Data.Serialize
 import Data.String (fromString)
 import System.Environment (getArgs)
 import System.IO.Tun (openTun)
+import System.Posix.Types (Fd)
+import System.Posix.IO.ByteString (fdRead, fdWrite)
 
 import qualified Data.ByteString.Char8 as BS
 
@@ -31,48 +34,61 @@ client :: String -> ByteString -> Int -> IO ()
 client device host port = do
     let settings = clientSettings port host
     runTCPClient settings $ \app -> do
-        mTunH <- openTun device
-        case mTunH of
-            Just tunH -> do
-                p1 <- async $ tunToNetPipe (sourceHandle tunH) (appSink app)
-                p2 <- async $ netToTunPipe (appSource app) (sinkHandle tunH)
+        mFd <- openTun device
+        case mFd of
+            Just fd -> do
+                p1 <- async $ tunSrcPipe fd $ appSink app
+                p2 <- async $ netSrcPipe (appSource app) fd
                 wait p1
                 wait p2
-            Nothing   -> putStrLn "Cannot open tun device"
+            Nothing -> putStrLn "Cannot open tun device"
 
 server :: String -> HostPreference -> Int -> IO ()
 server device preference port = do
     let settings = serverSettings port preference
     runTCPServer settings $ \app -> do
-        mTunH <- openTun device
-        case mTunH of
-            Just tunH -> do
-                p1 <- async $ netToTunPipe (appSource app) (sinkHandle tunH)
-                p2 <- async $ tunToNetPipe (sourceHandle tunH) (appSink app)
+        mFd <- openTun device
+        case mFd of
+            Just fd -> do
+                p1 <- async $ netSrcPipe (appSource app) fd
+                p2 <- async $ tunSrcPipe fd (appSink app)
                 wait p1
                 wait p2
-            Nothing   -> putStrLn "Cannot open tun device"
+            Nothing -> putStrLn "Cannot open tun device"
 
-tunToNetPipe :: Source IO ByteString -> Sink ByteString IO () -> IO ()
-tunToNetPipe src sink = src =$= (db "from tun => ") =$= toFrame =$= conduitPut put =$= (db "to net => ") $$ sink
+tunSrcPipe :: Fd -> Sink ByteString IO ()-> IO ()
+tunSrcPipe fd sink = tunSource fd 
+                 =$= toFrame
+                 =$= conduitPut put
+                 $$ sink
 
-netToTunPipe :: Source IO ByteString -> Sink ByteString IO () -> IO ()
-netToTunPipe src sink = src =$= (db "from net => ") =$= conduitGet2 get =$= toByteString =$= (db "to tun => ") $$ sink
+netSrcPipe :: Source IO ByteString -> Fd -> IO ()
+netSrcPipe src fd = src
+                =$= conduitGet2 get
+                =$= fromFrame
+                $$ tunSink fd
 
-sizeSink :: Sink ByteString IO ()
-sizeSink = awaitForever $ \pkg -> do
-    liftIO $ putStrLn $ show (BS.length pkg) ++ "  bytes received."
-    return ()
+tunSource :: Fd -> Source IO ByteString
+tunSource fd = forever $ do
+    pkt <- liftIO $ fdRead fd 2000
+    yield pkt
 
--- | Conduit to convert from 'ByteString' to 'Frame'.
+tunSink :: Fd -> Sink ByteString IO ()
+tunSink fd = awaitForever $ \pkt -> do
+    let l = BS.length pkt
+    ll <- liftIO $ fromIntegral <$> fdWrite fd pkt
+    if l == ll then return ()
+               else (liftIO $ putStrLn $ "Err: Written: " ++ show ll)
+
+{-inspectBs :: Conduit ByteString IO ByteString
+inspectBs = awaitForever $ \pkt -> do
+    liftIO $ putStrLn $ "Size: " ++ show (BS.length pkt)
+    liftIO $ BS.putStrLn pkt
+    yield pkt
+    -}
+
 toFrame :: Conduit ByteString IO Frame
 toFrame = awaitForever $ yield . Frame
 
--- | Conduit to conver from 'Frame' to 'ByteString'.
-toByteString :: Conduit Frame IO ByteString
-toByteString = awaitForever $ \(Frame bs) -> yield bs
-
-db :: String -> Conduit ByteString IO ByteString
-db label = awaitForever $ \bs -> do
-    liftIO $ putStrLn $ label ++ (show $ BS.length bs)
-    yield bs
+fromFrame :: Conduit Frame IO ByteString
+fromFrame = awaitForever $ \(Frame pkt) -> yield pkt
