@@ -3,92 +3,130 @@ module Main
     ( main
     ) where
 
-import Conduit
-import Control.Concurrent.Async (async, wait)
-import Control.Monad (forever)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Monad (forever, void, when)
 import Data.ByteString (ByteString)
-import Data.Conduit.Cereal
-import Data.Conduit.Network
-import Data.Serialize
-import Data.String (fromString)
+import Data.Word (Word8)
+import Foreign.Ptr (Ptr)
+import Foreign.Marshal.Alloc (allocaBytes)
+import Network.Nats
+import Network.Socket ( PortNumber
+                      , SockAddr (..)
+                      , Family (..)
+                      , SocketType (..)
+                      , Socket
+                      , bind
+                      , defaultProtocol
+                      , socket
+                      , inet_addr
+                      , recvBufFrom
+                      , sendBufTo
+                      )
 import System.Environment (getArgs)
 import System.IO.Tun (openTun)
+import System.Posix.IO (fdReadBuf, fdWriteBuf)
 import System.Posix.Types (Fd)
-import System.Posix.IO.ByteString (fdRead, fdWrite)
 
 import qualified Data.ByteString.Char8 as BS
 
-import Data.Message.Frame
+import Types (ServiceConfig (..), Interface (..))
 
 main :: IO ()
 main = do
     args <- getArgs
     case args of
-        ["client", device, host, port]       -> 
-            client device (BS.pack $ host) (read port)
-        ["server", device, preference, port] ->
-            server device (fromString preference) (read port)
-        _ -> putStrLn "Unknown config"
+        ["client", ownIp, natsUri, device] ->
+            tunPlug ownIp natsUri 
+                    ("service.register.client", "service.request.server")
+                    device
 
-client :: String -> ByteString -> Int -> IO ()
-client device host port = do
-    let settings = clientSettings port host
-    runTCPClient settings $ \app -> do
-        mFd <- openTun device
-        case mFd of
-            Just fd -> do
-                p1 <- async $ tunSrcPipe fd $ appSink app
-                p2 <- async $ netSrcPipe (appSource app) fd
-                wait p1
-                wait p2
-            Nothing -> putStrLn "Cannot open tun device"
+        ["server", ownIp, natsUri, device] ->
+            tunPlug ownIp natsUri
+                    ("service.register.server", "service.request.client")
+                    device
+        _                                  ->
+            putStrLn "Usage: tun-plugs [client|server] <ip> <natsUri> <tun>"
 
-server :: String -> HostPreference -> Int -> IO ()
-server device preference port = do
-    let settings = serverSettings port preference
-    runTCPServer settings $ \app -> do
-        mFd <- openTun device
-        case mFd of
-            Just fd -> do
-                p1 <- async $ netSrcPipe (appSource app) fd
-                p2 <- async $ tunSrcPipe fd (appSink app)
-                wait p1
-                wait p2
-            Nothing -> putStrLn "Cannot open tun device"
+tunPlug :: String -> String -> (Topic, Topic) -> String -> IO ()
+tunPlug ownIp natsUri (ownSide, otherSide) device = do
+    let settings = defaultSettings { loggerSpec = StdoutLogger }
+    runNatsClient settings (BS.pack natsUri) $ \conn -> do
 
-tunSrcPipe :: Fd -> Sink ByteString IO ()-> IO ()
-tunSrcPipe fd sink = tunSource fd 
-                 =$= toFrame
-                 =$= conduitPut put
-                 $$ sink
+        -- Publish myselves.
+        pubJson' conn ownSide $ mkConfig ownIp
 
-netSrcPipe :: Source IO ByteString -> Fd -> IO ()
-netSrcPipe src fd = src
-                =$= conduitGet2 get
-                =$= fromFrame
-                $$ tunSink fd
+        -- Waiting for peer discovery.
+        mPeer <- waitForPeer conn otherSide
+        maybe (putStrLn "Error: Cannot decode peer ServiceConfig")
+              (setupPlugs ownIp device)
+              mPeer
 
-tunSource :: Fd -> Source IO ByteString
-tunSource fd = forever $ do
-    pkt <- liftIO $ fdRead fd 2000
-    yield pkt
+setupPlugs :: String -> String -> ServiceConfig -> IO ()
+setupPlugs ownIp device conf = do
+    let ifc = head $ interfaces conf
+    sock <- serverSocket ownIp $ fromIntegral udpSocket
+    peer <- sockAddr (address ifc) (fromIntegral $ port ifc)
+    mFd  <- openTun device
+    case mFd of
+        Just fd -> do
+            forkIO $ tunToSock fd (sock, peer)
+            sockToTun sock fd
 
-tunSink :: Fd -> Sink ByteString IO ()
-tunSink fd = awaitForever $ \pkt -> do
-    let l = BS.length pkt
-    ll <- liftIO $ fromIntegral <$> fdWrite fd pkt
-    if l == ll then return ()
-               else (liftIO $ putStrLn $ "Err: Written: " ++ show ll)
+        Nothing -> putStrLn "setupPlugs: cannot open tun device"
 
-{-inspectBs :: Conduit ByteString IO ByteString
-inspectBs = awaitForever $ \pkt -> do
-    liftIO $ putStrLn $ "Size: " ++ show (BS.length pkt)
-    liftIO $ BS.putStrLn pkt
-    yield pkt
-    -}
+tunToSock :: Fd -> (Socket, SockAddr) -> IO ()
+tunToSock fd (sock, peer) = allocaBytes 1500 go
+    where
+      go :: Ptr Word8 -> IO ()
+      go ptr = do
+          bytesGot  <- fromIntegral <$> fdReadBuf fd ptr 1500
+          bytesSent <- sendBufTo sock ptr bytesGot peer
+          when (bytesGot /= bytesSent) $ putStrLn "tunToSock: size warning"
+          go ptr
 
-toFrame :: Conduit ByteString IO Frame
-toFrame = awaitForever $ yield . Frame
+sockToTun :: Socket -> Fd -> IO ()
+sockToTun sock fd = allocaBytes 1500 go
+    where
+      go :: Ptr Word8 -> IO ()
+      go ptr = do
+          (bytesGot, _) <- recvBufFrom sock ptr 1500
+          let bytesGot' = fromIntegral bytesGot
+          bytesSent <- fdWriteBuf fd ptr bytesGot'
+          when (bytesGot' /= bytesSent) $ putStrLn "sockToTun: size warning"
+          go ptr
 
-fromFrame :: Conduit Frame IO ByteString
-fromFrame = awaitForever $ \(Frame pkt) -> yield pkt
+mkConfig :: String -> ServiceConfig
+mkConfig host = 
+    ServiceConfig
+        { interfaces =
+            [ Interface
+                { role     = "Tunnel"
+                , address  = host
+                , port     = udpSocket
+                , protocol = "UDP"
+                }
+            ]
+        }
+
+waitForPeer :: Connection -> Topic -> IO (Maybe ServiceConfig)
+waitForPeer conn topic = do
+    putStrLn "Wait for peer discovery ..."
+    go
+    where
+      go = do
+          mResp <- requestJSON conn topic ([] :: [Int]) $ Sec 10
+          maybe (putStrLn "Still waiting ..." >> go)
+                (\(JsonMsg _ _ _ msg) -> return msg)
+                mResp
+
+udpSocket :: Int
+udpSocket = 8000
+
+serverSocket :: String -> PortNumber -> IO Socket
+serverSocket host port' = do
+    sock <- socket AF_INET Datagram defaultProtocol
+    bind sock =<< sockAddr host port'
+    return sock
+
+sockAddr :: String -> PortNumber -> IO SockAddr
+sockAddr host port' = SockAddrInet port' <$> inet_addr host

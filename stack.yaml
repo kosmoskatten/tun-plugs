@@ -4,6 +4,7 @@ resolver: lts-6.2
 packages:
   - '.'
   - '../htun'
+  - '../nats-client'
 
 # Packages to be pulled from upstream that are not in the resolver (e.g., acme-missiles-0.3)
 extra-deps: []
