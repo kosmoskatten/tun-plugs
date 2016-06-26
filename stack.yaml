@@ -1,10 +1,11 @@
-resolver: lts-6.2
+resolver: lts-6.4
 
 # Local packages, usually specified by relative directory name
 packages:
   - '.'
   - '../htun'
   - '../nats-client'
+  - '../micro-disc/disc-info'
 
 # Packages to be pulled from upstream that are not in the resolver (e.g., acme-missiles-0.3)
 extra-deps: []

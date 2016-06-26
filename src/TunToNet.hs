@@ -3,13 +3,29 @@ module Main
     ( main
     ) where
 
-import Control.Concurrent (forkIO, threadDelay)
-import Control.Monad (forever, void, when)
-import Data.ByteString (ByteString)
+import Control.Concurrent (forkIO)
+import Control.Monad (void, when)
 import Data.Word (Word8)
+import Data.String.Conv (toS)
 import Foreign.Ptr (Ptr)
 import Foreign.Marshal.Alloc (allocaBytes)
-import Network.Nats
+import Network.Discovery.Info ( Info (..)
+                              , Interface (..)
+                              , Payload (..)
+                              , Protocol (..)
+                              )
+import Network.Nats ( Connection
+                    , JsonMsg (..)
+                    , NatsMsg (..)
+                    , Timeout (..)
+                    , Topic
+                    , defaultSettings
+                    , pub'
+                    , pubJson'
+                    , requestJSON
+                    , runNatsClient
+                    , subAsync'
+                    )
 import Network.Socket ( PortNumber
                       , SockAddr (..)
                       , Family (..)
@@ -29,31 +45,36 @@ import System.Posix.Types (Fd)
 
 import qualified Data.ByteString.Char8 as BS
 
-import Types (ServiceConfig (..), Interface (..))
-
 main :: IO ()
 main = do
     args <- getArgs
     case args of
-        ["client", ownIp, natsUri, device] ->
-            tunPlug ownIp natsUri 
-                    ("service.register.client", "service.request.server")
+        ["aside", ownIp, natsUri, device] ->
+            tunPlug "aside-tunnel" ownIp natsUri 
+                    ( "service.register.aside-tunnel"
+                    , "service.discover.bside-tunnel"
+                    )
                     device
 
-        ["server", ownIp, natsUri, device] ->
-            tunPlug ownIp natsUri
-                    ("service.register.server", "service.request.client")
+        ["bside", ownIp, natsUri, device] ->
+            tunPlug "bside-tunnel" ownIp natsUri
+                    ( "service.register.bside-tunnel"
+                    , "service.discover.aside-tunnel"
+                    )
                     device
         _                                  ->
-            putStrLn "Usage: tun-plugs [client|server] <ip> <natsUri> <tun>"
+            putStrLn "Usage: tun-plugs [aside|bside] <ip> <natsUri> <tun>"
 
-tunPlug :: String -> String -> (Topic, Topic) -> String -> IO ()
-tunPlug ownIp natsUri (ownSide, otherSide) device = do
-    let settings = defaultSettings { loggerSpec = StdoutLogger }
-    runNatsClient settings (BS.pack natsUri) $ \conn -> do
+tunPlug :: Topic -> String -> String -> (Topic, Topic) -> String -> IO ()
+tunPlug ownName ownIp natsUri (ownSide, otherSide) device =
+    runNatsClient defaultSettings (BS.pack natsUri) $ \conn -> do
 
         -- Publish myselves.
         pubJson' conn ownSide $ mkConfig ownIp
+
+        -- Subscribe to pings.
+        void $ subAsync' conn (ownName `BS.append` ".ping") $
+            \(NatsMsg _ _ (Just replyTo) p) -> pub' conn replyTo p 
 
         -- Waiting for peer discovery.
         mPeer <- waitForPeer conn otherSide
@@ -61,15 +82,15 @@ tunPlug ownIp natsUri (ownSide, otherSide) device = do
               (setupPlugs ownIp device)
               mPeer
 
-setupPlugs :: String -> String -> ServiceConfig -> IO ()
-setupPlugs ownIp device conf = do
-    let ifc = head $ interfaces conf
+setupPlugs :: String -> String -> Info -> IO ()
+setupPlugs ownIp device info = do
+    let ifc = head $ interfaces info
     sock <- serverSocket ownIp $ fromIntegral udpSocket
-    peer <- sockAddr (address ifc) (fromIntegral $ port ifc)
+    peer <- sockAddr (toS $ address ifc) (fromIntegral $ port ifc)
     mFd  <- openTun device
     case mFd of
         Just fd -> do
-            forkIO $ tunToSock fd (sock, peer)
+            void $ forkIO $ tunToSock fd (sock, peer)
             sockToTun sock fd
 
         Nothing -> putStrLn "setupPlugs: cannot open tun device"
@@ -95,20 +116,21 @@ sockToTun sock fd = allocaBytes 1500 go
           when (bytesGot' /= bytesSent) $ putStrLn "sockToTun: size warning"
           go ptr
 
-mkConfig :: String -> ServiceConfig
-mkConfig host = 
-    ServiceConfig
-        { interfaces =
-            [ Interface
-                { role     = "Tunnel"
-                , address  = host
-                , port     = udpSocket
-                , protocol = "UDP"
-                }
+mkConfig :: String -> Info
+mkConfig ip =
+    Info { service    = "TunToNet. TUN to UDP transport tunnel."
+         , version    = "0.0.1.0"
+         , interfaces =
+            [ Interface { role     = "Tunnel"
+                        , protocol = UDP
+                        , address  = toS ip
+                        , port     = udpSocket
+                        , payload  = Payload "IP packets"
+                        }
             ]
-        }
+         }
 
-waitForPeer :: Connection -> Topic -> IO (Maybe ServiceConfig)
+waitForPeer :: Connection -> Topic -> IO (Maybe Info)
 waitForPeer conn topic = do
     putStrLn "Wait for peer discovery ..."
     go
